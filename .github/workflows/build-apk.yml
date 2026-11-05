@@ -29,7 +29,9 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
 
       - name: Install Android SDK and Native Tools
         run: |
@@ -37,6 +39,7 @@ jobs:
             "platforms;android-37" \
             "cmake;3.22.1" \
             "ndk;latest"
+
           yes | sdkmanager --licenses
 
       - name: Build LastWave Debug APK
