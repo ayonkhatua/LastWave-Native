@@ -29,12 +29,6 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
-        with:
-          packages: |
-            platform-tools
-            platforms;android-37
-            cmake;3.22.1
-            ndk;latest
 
       - name: Build LastWave Debug APK
         run: |
