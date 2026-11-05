@@ -1,4 +1,3 @@
-
 name: Build LastWave APK
 
 on:
@@ -31,16 +30,11 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
-          packages: 'platform-tools'
-
-      - name: Install Android SDK and Native Tools
-        run: |
-          sdkmanager --install \
-            "platforms;android-37" \
-            "cmake;3.22.1" \
-            "ndk;latest"
-
-          yes | sdkmanager --licenses
+          packages: |
+            platform-tools
+            platforms;android-37
+            cmake;3.22.1
+            ndk;latest
 
       - name: Build LastWave Debug APK
         run: |
