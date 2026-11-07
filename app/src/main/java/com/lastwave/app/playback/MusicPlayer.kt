@@ -82,7 +82,7 @@ import com.lastwave.app.data.playlist.PlaylistRepository
 import com.lastwave.app.data.plugin.ModuleDrmFactory
 import com.lastwave.app.data.plugin.SegmentedDashBridge
 import com.lastwave.app.data.plugin.stableCacheKey
-import com.lastwave.app.data.repository.RelatedGraphRepository
+import com.lastwave.app.data.recommend.RecommendationRepository
 import com.lastwave.app.playback.resolve.MetadataLog
 import com.lastwave.app.playback.resolve.PlaybackStartupLog
 import com.lastwave.app.playback.resolve.StreamCache
@@ -262,7 +262,7 @@ data class PlaybackProgressState(
 class MusicPlayer @Inject constructor(
     @ApplicationContext context: Context,
     private val innerTube: InnerTubeMusicApi,
-    private val relatedGraph: RelatedGraphRepository,
+    private val recommendationRepository: RecommendationRepository,
     private val losslessMusicApi: LosslessMusicApi,
     private val moduleDrmFactory: ModuleDrmFactory,
     private val moduleManager: com.lastwave.app.data.plugin.ModuleManager,
@@ -512,6 +512,16 @@ class MusicPlayer @Inject constructor(
     private var crossfadeEnabled = false
     @Volatile
     private var crossfadeDurationMs = 5_000L
+    /**
+     * Mirror of [MiscSettings.stopPlaybackOnTaskRemoved] for the playback
+     * service, which cannot block on DataStore from onTaskRemoved(). The
+     * default matches the preference's default so a task removal that races
+     * the first settings emission still stops playback.
+     */
+    @Volatile
+    private var stopPlaybackOnTaskRemovedPref = true
+    val stopPlaybackOnTaskRemoved: Boolean
+        get() = stopPlaybackOnTaskRemovedPref
     private var activePlayer: ExoPlayer? = null
     private var secondaryPlayer: ExoPlayer? = null
     private var secondaryNativeEngine: NativeAudioEngine? = null
@@ -749,9 +759,9 @@ class MusicPlayer @Inject constructor(
         // waits a full connect timeout on broken IPv6 routes before trying IPv4.
         // Keep media off the API client's interceptors and disk HTTP cache.
         val mediaHttp = okhttp3.OkHttpClient.Builder()
-            .dns(com.lastwave.app.data.network.Ipv4FirstDnsResolver())
-            .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
-            .readTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+            .dns(com.lastwave.app.data.network.Ipv4FirstDnsResolver(context = appContext))
+            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
             .build()
@@ -1073,13 +1083,12 @@ class MusicPlayer @Inject constructor(
                 val isLocal = currentTrack.isLocalTrack() || mediaItem.mediaId.startsWith("local:")
                 val hasNonPlaceholderUri = mediaItem.localConfiguration?.uri?.scheme?.let { it != "lastwave" } == true
                 val isStreamExpired = prepared?.isExpired() == true
-                val isPlayingOrReady = targetPlayer.isPlaying || targetPlayer.playbackState == Player.STATE_READY
-                val needsResolution = (!hasNonPlaceholderUri || (!isLocal && isStreamExpired)) && !isPlayingOrReady
+                val needsResolution = !hasNonPlaceholderUri || (!isLocal && isStreamExpired)
                 if (needsResolution) {
                     // During lazy-player construction a restored queue is
                     // installed before the lazy value is published. Defer
                     // resolution until the first explicit playback action.
-                    if (playerDelegate.isInitialized()) {
+                    if (playerDelegate.isInitialized() && targetPlayer.playWhenReady) {
                         resolveAndPlayQueueItem(currentIndex)
                     }
                     return
@@ -2271,6 +2280,7 @@ class MusicPlayer @Inject constructor(
             settingsPreferences.settings.collect { settings ->
                 crossfadeEnabled = settings.crossfadeEnabled
                 crossfadeDurationMs = settings.crossfadeSeconds.coerceIn(1, 12) * 1000L
+                stopPlaybackOnTaskRemovedPref = settings.stopPlaybackOnTaskRemoved
                 val wasBitPerfect = bitPerfectEnabled
                 bitPerfectEnabled = settings.isBitPerfectEnabled
                 systemEffectsModePref = settings.systemEffectsMode
@@ -5765,28 +5775,68 @@ class MusicPlayer @Inject constructor(
         knownSongKeys: Set<String>,
         recentHistoryKeys: Set<String>,
     ): List<PlayableTrack> {
-        val lastTrack = currentQueue.lastOrNull { !it.videoId.isNullOrBlank() }
-        val lastVideoId = lastTrack?.videoId
-        if (lastVideoId == null || lastVideoId in radioUsedSeeds) {
+        val candidateTrack = currentQueue.asReversed().firstOrNull {
+            !it.videoId.isNullOrBlank() && it.videoId !in radioUsedSeeds
+        } ?: run {
+            // Recycle seeds so endless radio playback never terminates
+            radioUsedSeeds.clear()
+            currentQueue.lastOrNull { !it.videoId.isNullOrBlank() }
+        }
+        val seedVideoId = candidateTrack?.videoId
+        if (seedVideoId == null) {
             android.util.Log.d("MusicPlayer", "No fresh seed track available for radio re-seeding; stopping extending quietly")
             return emptyList()
         }
-        radioUsedSeeds.add(lastVideoId)
-        android.util.Log.i("MusicPlayer", "Re-seeding YTM radio with RDAMVM of last track in queue: $lastVideoId")
-        val reseedResult = retryRadioRequest { innerTube.fetchRadio(lastVideoId) }
+        radioUsedSeeds.add(seedVideoId)
+        if (recommendationRepository.isSpotifyActive()) {
+            android.util.Log.i("MusicPlayer", "Re-seeding Spotify recommendations from queue track: $seedVideoId")
+            val seeded = recommendationRepository.relatedFor(
+                seedVideoId = seedVideoId,
+                title = candidateTrack.title,
+                artist = candidateTrack.artist,
+                limit = 30,
+                durationSeconds = candidateTrack.durationMs?.let { (it / 1000L).toInt() },
+            )
+            return PureRadioQueue.filterStrictYtmRadioBatch(
+                incomingTracks = seeded.map { it.toPlayableTrack() },
+                existingVideoIds = knownVideoIds,
+                existingKeys = knownKeys,
+                existingSongKeys = knownSongKeys,
+                recentVideoIds = recentHistoryKeys,
+                recentKeys = recentHistoryKeys,
+                seedVideoId = seedVideoId,
+                seedSongKey = PureRadioQueue.normalizedSongKey(candidateTrack.title, candidateTrack.artist),
+            )
+        }
+        android.util.Log.i("MusicPlayer", "Re-seeding YTM radio with RDAMVM of queue track: $seedVideoId")
+        val reseedResult = retryRadioRequest { innerTube.fetchRadio(seedVideoId) }
         return if (reseedResult != null && reseedResult.tracks.isNotEmpty()) {
             currentRadioContinuationToken = reseedResult.continuationToken
             currentRadioAutomixPlaylistId = reseedResult.automixPlaylistId
-            PureRadioQueue.filterStrictYtmRadioBatch(
+            val filtered = PureRadioQueue.filterStrictYtmRadioBatch(
                 incomingTracks = reseedResult.tracks.map { it.toPlayableTrack() },
                 existingVideoIds = knownVideoIds,
                 existingKeys = knownKeys,
                 existingSongKeys = knownSongKeys,
                 recentVideoIds = recentHistoryKeys,
                 recentKeys = recentHistoryKeys,
-                seedVideoId = lastVideoId,
-                seedSongKey = PureRadioQueue.normalizedSongKey(lastTrack.title, lastTrack.artist),
+                seedVideoId = seedVideoId,
+                seedSongKey = PureRadioQueue.normalizedSongKey(candidateTrack.title, candidateTrack.artist),
             )
+            if (filtered.isEmpty()) {
+                PureRadioQueue.filterStrictYtmRadioBatch(
+                    incomingTracks = reseedResult.tracks.map { it.toPlayableTrack() },
+                    existingVideoIds = knownVideoIds,
+                    existingKeys = knownKeys,
+                    existingSongKeys = knownSongKeys,
+                    recentVideoIds = emptySet(),
+                    recentKeys = emptySet(),
+                    seedVideoId = seedVideoId,
+                    seedSongKey = PureRadioQueue.normalizedSongKey(candidateTrack.title, candidateTrack.artist),
+                )
+            } else {
+                filtered
+            }
         } else {
             android.util.Log.d("MusicPlayer", "Re-seeding with RDAMVM returned no tracks; stopping extending quietly")
             emptyList()
@@ -5828,7 +5878,26 @@ class MusicPlayer @Inject constructor(
                     val existingSongKeys = existingTracks.mapTo(mutableSetOf()) { PureRadioQueue.normalizedSongKey(it.title, it.artist) }
                     val recentHistoryKeys = playHistory.takeLast(50).toSet()
 
-                    val toAdd: List<PlayableTrack> = if (seedVideoId != null) {
+                    val toAdd: List<PlayableTrack> = if (seedVideoId != null && recommendationRepository.isSpotifyActive()) {
+                        val seeded = recommendationRepository.relatedFor(
+                            seedVideoId = seedVideoId,
+                            title = seed.title,
+                            artist = seed.artist,
+                            limit = 30,
+                            durationSeconds = seed.durationMs?.let { (it / 1000L).toInt() },
+                        )
+                        if (expectedGeneration != playRequestGeneration.get() || !radioQueueActive) return@withLock
+                        PureRadioQueue.filterStrictYtmRadioBatch(
+                            incomingTracks = seeded.map { it.toPlayableTrack() },
+                            existingVideoIds = existingVideoIds,
+                            existingKeys = existingKeys,
+                            existingSongKeys = existingSongKeys,
+                            recentVideoIds = recentHistoryKeys,
+                            recentKeys = recentHistoryKeys,
+                            seedVideoId = seedVideoId,
+                            seedSongKey = PureRadioQueue.normalizedSongKey(seed.title, seed.artist),
+                        )
+                    } else if (seedVideoId != null) {
                         val radioResult = retryRadioRequest { innerTube.fetchRadio(seedVideoId) }
                         if (expectedGeneration != playRequestGeneration.get() || !radioQueueActive) return@withLock
 
@@ -5969,7 +6038,7 @@ class MusicPlayer @Inject constructor(
                     val result = retryRadioRequest { innerTube.fetchRadioContinuation(continuationToken) }
                     if (expectedGeneration != playRequestGeneration.get() || !radioQueueActive) return@launch
 
-                    if (result != null && result.tracks.isNotEmpty()) {
+                    val filtered = if (result != null && result.tracks.isNotEmpty()) {
                         currentRadioContinuationToken = result.continuationToken
                         if (result.automixPlaylistId != null) {
                             currentRadioAutomixPlaylistId = result.automixPlaylistId
@@ -5982,13 +6051,17 @@ class MusicPlayer @Inject constructor(
                             recentVideoIds = recentHistoryKeys,
                             recentKeys = recentHistoryKeys,
                         )
+                    } else emptyList()
+
+                    if (filtered.isNotEmpty()) {
+                        filtered
                     } else if (!automixId.isNullOrBlank()) {
                         currentRadioContinuationToken = null
                         currentRadioAutomixPlaylistId = null
                         val automixResult = retryRadioRequest { innerTube.fetchRadioByPlaylistId(automixId) }
                         if (expectedGeneration != playRequestGeneration.get() || !radioQueueActive) return@launch
 
-                        if (automixResult != null && automixResult.tracks.isNotEmpty()) {
+                        val automixFiltered = if (automixResult != null && automixResult.tracks.isNotEmpty()) {
                             currentRadioContinuationToken = automixResult.continuationToken
                             currentRadioAutomixPlaylistId = automixResult.automixPlaylistId
                             PureRadioQueue.filterStrictYtmRadioBatch(
@@ -5999,6 +6072,10 @@ class MusicPlayer @Inject constructor(
                                 recentVideoIds = recentHistoryKeys,
                                 recentKeys = recentHistoryKeys,
                             )
+                        } else emptyList()
+
+                        if (automixFiltered.isNotEmpty()) {
+                            automixFiltered
                         } else {
                             reseedWithLastQueueSong(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys)
                         }
@@ -6011,7 +6088,7 @@ class MusicPlayer @Inject constructor(
                     val automixResult = retryRadioRequest { innerTube.fetchRadioByPlaylistId(automixId) }
                     if (expectedGeneration != playRequestGeneration.get() || !radioQueueActive) return@launch
 
-                    if (automixResult != null && automixResult.tracks.isNotEmpty()) {
+                    val automixFiltered = if (automixResult != null && automixResult.tracks.isNotEmpty()) {
                         currentRadioContinuationToken = automixResult.continuationToken
                         currentRadioAutomixPlaylistId = automixResult.automixPlaylistId
                         PureRadioQueue.filterStrictYtmRadioBatch(
@@ -6022,6 +6099,10 @@ class MusicPlayer @Inject constructor(
                             recentVideoIds = recentHistoryKeys,
                             recentKeys = recentHistoryKeys,
                         )
+                    } else emptyList()
+
+                    if (automixFiltered.isNotEmpty()) {
+                        automixFiltered
                     } else {
                         reseedWithLastQueueSong(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys)
                     }
@@ -6029,14 +6110,18 @@ class MusicPlayer @Inject constructor(
                     reseedWithLastQueueSong(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys)
                 }
 
-                if (toAdd.isEmpty() || !radioQueueActive || expectedGeneration != playRequestGeneration.get()) return@launch
+                val finalToAdd = if (toAdd.isEmpty() && forceIfAtEnd) {
+                    reseedWithLastQueueSong(currentQueue, knownVideoIds, knownKeys, knownSongKeys, emptySet())
+                } else toAdd
+
+                if (finalToAdd.isEmpty() || !radioQueueActive || expectedGeneration != playRequestGeneration.get()) return@launch
 
                 withContext(Dispatchers.Main.immediate) {
                     if (!radioQueueActive || !playerDelegate.isInitialized() || expectedGeneration != playRequestGeneration.get()) return@withContext
                     val existingKeys = (0 until player.mediaItemCount).mapTo(mutableSetOf()) {
                         player.getMediaItemAt(it).toPlayableTrack().queueKey()
                     }
-                    val validToAdd = toAdd.filter { it.queueKey() !in existingKeys }
+                    val validToAdd = finalToAdd.filter { it.queueKey() !in existingKeys }
                     if (validToAdd.isNotEmpty()) {
                         val previousCount = player.mediaItemCount
                         player.addMediaItems(validToAdd.map(PlayableTrack::toMediaItem))

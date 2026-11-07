@@ -73,6 +73,24 @@ enum class LyricsProvider(val id: String, val title: String, val subtitle: Strin
     }
 }
 
+enum class RecommendationSource(val id: String, val titleRes: Int, val subtitleRes: Int) {
+    YOUTUBE_MUSIC(
+        "youtube_music",
+        com.lastwave.app.R.string.recommendation_source_yt_music,
+        com.lastwave.app.R.string.recommendation_source_yt_music_sub,
+    ),
+    SPOTIFY(
+        "spotify",
+        com.lastwave.app.R.string.recommendation_source_spotify,
+        com.lastwave.app.R.string.recommendation_source_spotify_sub,
+    );
+
+    companion object {
+        fun fromId(id: String?): RecommendationSource =
+            entries.firstOrNull { it.id == id } ?: YOUTUBE_MUSIC
+    }
+}
+
 data class MiscSettings(
     /** When on, the app's accent color follows the dominant color of the
      *  currently-scrobbling track's artwork (Home's "now playing" track),
@@ -126,6 +144,10 @@ data class MiscSettings(
      *  AUTO races all providers (fastest valid word-sync wins); an explicit
      *  pick is tried first with the rest as fallback. */
     val lyricsProvider: LyricsProvider = LyricsProvider.AUTO,
+    /** Which service seeds recommendations (Settings -> Spotify). */
+    val recommendationSource: RecommendationSource = RecommendationSource.YOUTUBE_MUSIC,
+    /** Whether Spotify account playlists & Liked Songs are shown in the Playlists library. */
+    val spotifyPlaylistsSyncEnabled: Boolean = false,
     val lyricsOffsetMs: Long = 0L,
     /** Scale factor applied to lyrics font size across both modern and classic views.
      *  Default 1.0f (100%), clamped between 0.7f (70%) and 1.5f (150%). */
@@ -206,6 +228,10 @@ data class MiscSettings(
     /** When false, podcast shelves, screens and episode search stay hidden.
      *  Existing progress is preserved so re-enabling resumes where you left off. */
     val podcastsEnabled: Boolean = true,
+    /** When true (default), removing LastWave from Recents stops playback and
+     *  tears down the playback service. When false, playback keeps running in
+     *  the background after the task is removed. */
+    val stopPlaybackOnTaskRemoved: Boolean = true,
     val suppressYouTubeLoginPrompt: Boolean = false,
     val hasDismissedJoinSupportPrompt: Boolean = false,
     /** Display name used in LastWave Jam sessions. */
@@ -354,6 +380,8 @@ class SettingsPreferences @Inject constructor(
         val BIT_PERFECT_ENABLED = booleanPreferencesKey("lw_bit_perfect_enabled")
         val WORD_BY_WORD_LYRICS = booleanPreferencesKey("lw_word_by_word_lyrics")
         val LYRICS_PROVIDER = stringPreferencesKey("lw_lyrics_provider")
+        val RECOMMENDATION_SOURCE = stringPreferencesKey("lw_recommendation_source")
+        val SPOTIFY_PLAYLISTS_SYNC_ENABLED = booleanPreferencesKey("lw_spotify_playlists_sync_enabled")
         val LYRICS_OFFSET_MS = longPreferencesKey("lw_lyrics_offset_ms")
         val LYRICS_FONT_SCALE = floatPreferencesKey("lw_lyrics_font_scale")
         val APP_VOLUME = floatPreferencesKey("lw_app_volume")
@@ -397,6 +425,7 @@ class SettingsPreferences @Inject constructor(
         val LIKED_SONGS_LOCAL_SYNC = booleanPreferencesKey("lw_liked_songs_local_sync")
         val LIKED_SONGS_LOCAL_ONLY = stringPreferencesKey("lw_liked_songs_local_only")
         val PODCASTS_ENABLED = booleanPreferencesKey("lw_podcasts_enabled")
+        val STOP_PLAYBACK_ON_TASK_REMOVED = booleanPreferencesKey("lw_stop_playback_on_task_removed")
         val SUPPRESS_YOUTUBE_LOGIN_PROMPT = booleanPreferencesKey("lw_suppress_youtube_login_prompt")
         val HAS_DISMISSED_JOIN_SUPPORT_PROMPT = booleanPreferencesKey("lw_has_dismissed_join_support_prompt")
         val JAM_DISPLAY_NAME = stringPreferencesKey("lw_jam_display_name")
@@ -451,6 +480,8 @@ class SettingsPreferences @Inject constructor(
                 isBitPerfectEnabled = p.readSafely(Keys.BIT_PERFECT_ENABLED) ?: false,
                 wordByWordLyrics = p.readSafely(Keys.WORD_BY_WORD_LYRICS) ?: true,
                 lyricsProvider = LyricsProvider.fromId(p.readSafely(Keys.LYRICS_PROVIDER)),
+                recommendationSource = RecommendationSource.fromId(p.readSafely(Keys.RECOMMENDATION_SOURCE)),
+                spotifyPlaylistsSyncEnabled = p.readSafely(Keys.SPOTIFY_PLAYLISTS_SYNC_ENABLED) ?: false,
                 lyricsOffsetMs = (p.readSafely(Keys.LYRICS_OFFSET_MS) ?: 0L).coerceIn(-10000L, 10000L),
                 lyricsFontScale = (p.readSafely(Keys.LYRICS_FONT_SCALE) ?: 1.0f).coerceIn(0.7f, 1.5f),
                 crossfadeEnabled = p.readSafely(Keys.CROSSFADE_ENABLED) ?: false,
@@ -488,6 +519,7 @@ class SettingsPreferences @Inject constructor(
                 likedSongsYouTubeSync = p.readSafely(Keys.LIKED_SONGS_YOUTUBE_SYNC) ?: true,
                 likedSongsLocalSync = p.readSafely(Keys.LIKED_SONGS_LOCAL_SYNC) ?: true,
                 podcastsEnabled = p.readSafely(Keys.PODCASTS_ENABLED) ?: true,
+                stopPlaybackOnTaskRemoved = p.readSafely(Keys.STOP_PLAYBACK_ON_TASK_REMOVED) ?: true,
                 suppressYouTubeLoginPrompt = p.readSafely(Keys.SUPPRESS_YOUTUBE_LOGIN_PROMPT) ?: false,
                 hasDismissedJoinSupportPrompt = p.readSafely(Keys.HAS_DISMISSED_JOIN_SUPPORT_PROMPT) ?: false,
                 jamDisplayName = p.readSafely(Keys.JAM_DISPLAY_NAME)?.trim().orEmpty(),
@@ -658,6 +690,10 @@ class SettingsPreferences @Inject constructor(
         dataStore.edit { it[Keys.PODCASTS_ENABLED] = enabled }
     }
 
+    suspend fun setStopPlaybackOnTaskRemoved(enabled: Boolean) {
+        dataStore.edit { it[Keys.STOP_PLAYBACK_ON_TASK_REMOVED] = enabled }
+    }
+
     suspend fun setSuppressYouTubeLoginPrompt(suppress: Boolean) {
         dataStore.edit { it[Keys.SUPPRESS_YOUTUBE_LOGIN_PROMPT] = suppress }
     }
@@ -730,6 +766,14 @@ class SettingsPreferences @Inject constructor(
 
     suspend fun setLyricsProvider(provider: LyricsProvider) {
         dataStore.edit { it[Keys.LYRICS_PROVIDER] = provider.id }
+    }
+
+    suspend fun setRecommendationSource(source: RecommendationSource) {
+        dataStore.edit { it[Keys.RECOMMENDATION_SOURCE] = source.id }
+    }
+
+    suspend fun setSpotifyPlaylistsSyncEnabled(enabled: Boolean) {
+        dataStore.edit { it[Keys.SPOTIFY_PLAYLISTS_SYNC_ENABLED] = enabled }
     }
 
     suspend fun setLyricsOffsetMs(offsetMs: Long) {

@@ -174,7 +174,31 @@ class SettingsViewModel @Inject constructor(
     fun disconnectSpotify() {
         viewModelScope.launch {
             spotifyPreferences.clearConnection()
-            _uiState.update { it.copy(toastMessage = "Spotify account disconnected") }
+            settingsPreferences.setRecommendationSource(com.lastwave.app.data.local.RecommendationSource.YOUTUBE_MUSIC)
+            settingsPreferences.setSpotifyPlaylistsSyncEnabled(false)
+            _uiState.update { it.copy(toastMessage = appContext.getString(com.lastwave.app.R.string.toast_spotify_disconnected)) }
+        }
+    }
+
+    fun setSpotifyPlaylistsSyncEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            if (enabled && !spotifyConnected.value) {
+                _uiState.update { it.copy(toastMessage = appContext.getString(com.lastwave.app.R.string.toast_spotify_connect_first)) }
+                return@launch
+            }
+            settingsPreferences.setSpotifyPlaylistsSyncEnabled(enabled)
+        }
+    }
+
+    fun setRecommendationSource(source: com.lastwave.app.data.local.RecommendationSource) {
+        viewModelScope.launch {
+            val usable = source != com.lastwave.app.data.local.RecommendationSource.SPOTIFY || spotifyConnected.value
+            settingsPreferences.setRecommendationSource(
+                if (usable) source else com.lastwave.app.data.local.RecommendationSource.YOUTUBE_MUSIC,
+            )
+            if (!usable) {
+                _uiState.update { it.copy(toastMessage = appContext.getString(com.lastwave.app.R.string.toast_spotify_connect_first)) }
+            }
         }
     }
 
@@ -656,6 +680,10 @@ class SettingsViewModel @Inject constructor(
     fun setPodcastsEnabled(enabled: Boolean) = launchSettingsAction("update podcasts setting") {
         settingsPreferences.setPodcastsEnabled(enabled)
     }
+    fun setStopPlaybackOnTaskRemoved(enabled: Boolean) =
+        launchSettingsAction("update stop playback on recents setting") {
+            settingsPreferences.setStopPlaybackOnTaskRemoved(enabled)
+        }
     fun setWordByWordLyrics(enabled: Boolean) = launchSettingsAction("update word-by-word lyrics") { settingsPreferences.setWordByWordLyrics(enabled) }
     fun setLyricsProvider(provider: com.lastwave.app.data.local.LyricsProvider) = launchSettingsAction("update lyrics provider") { settingsPreferences.setLyricsProvider(provider) }
     fun setLyricsOffsetMs(offsetMs: Long) = launchSettingsAction("update lyrics sync offset") {

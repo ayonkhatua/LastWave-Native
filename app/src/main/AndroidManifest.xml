@@ -234,7 +234,7 @@
             android:exported="true"
             android:icon="@mipmap/ic_launcher"
             android:label="@string/app_name"
-            android:stopWithTask="true"
+            android:stopWithTask="false"
             android:foregroundServiceType="mediaPlayback">
             <intent-filter>
                 <action android:name="android.media.browse.MediaBrowserService" />
@@ -306,6 +306,19 @@
         <receiver
             android:name=".widget.wave.WaveWidgetActionReceiver"
             android:exported="false" />
+
+        <!-- Classic Now Playing widget -->
+        <receiver
+            android:name=".widget.NowPlayingWidgetReceiver"
+            android:exported="false"
+            android:label="@string/widget_name">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/now_playing_widget_info" />
+        </receiver>
 
         <!-- Receiver for cancel/reconnect actions on background-download notifications -->
         <receiver
